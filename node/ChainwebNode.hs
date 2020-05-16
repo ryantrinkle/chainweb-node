@@ -479,12 +479,55 @@ mainInfo = programInfoValidate
     validateChainwebNodeConfiguration
 
 main :: IO ()
-main = runWithPkgInfoConfiguration mainInfo pkgInfo $ \conf -> do
-    let v = _configChainwebVersion $ _nodeConfigChainweb conf
-    hSetBuffering stderr LineBuffering
-    withNodeLogger (_nodeConfigLog conf) v $ \logger -> do
-        kt <- mapM (parseTimeM False defaultTimeLocale timeFormat) killSwitchDate
-        withKillSwitch (logFunctionText logger) kt $
-            node conf logger
+main = do
+    installSignalHandlers
+    runWithPkgInfoConfiguration mainInfo pkgInfo $ \conf -> do
+        let v = _configChainwebVersion $ _nodeConfigChainweb conf
+        hSetBuffering stderr LineBuffering
+        withNodeLogger (_nodeConfigLog conf) v $ \logger -> do
+            kt <- mapM (parseTimeM False defaultTimeLocale timeFormat) killSwitchDate
+            withKillSwitch (logFunctionText logger) kt $
+                node conf logger
   where
     timeFormat = iso8601DateFormat (Just "%H:%M:%SZ")
+
+-- -------------------------------------------------------------------------- --
+-- Utils
+
+newtype SignalException = SignalException Signal deriving (Show, Eq, Generic)
+instance Exception SignalException
+
+-- | Handle SIGTERM (and other signals) that are supposed to terminate the
+-- program. By default GHCs RTS only installs a handler for SIGINT (Ctrl-C).
+-- This function install handlers that that raise an exception on the main
+-- thread when a signal is received. This causes the execution of finalization
+-- logic in brackets.
+--
+-- This is particularly important for the SQLite, because it resets the WAL
+-- files. Otherwise the files would never be deallocated and would remain at
+-- their maximum size forever. Graceful shutdown will also result in better
+-- logging of issues and prevent data corruption or missing data in database
+-- backends.
+--
+-- The implementation is copied fom
+-- <https://ro-che.info/articles/2014-07-30-bracket>, which also explains
+-- details.
+--
+-- This asssumes that threads are managed properly. Threads that are spawned by
+-- just calling forkIO, won't be notified and terminate without executing
+-- termination logic.
+--
+installSignalHandlers :: IO ()
+installSignalHandlers = do
+  main_thread_id <- myThreadId
+  weak_tid <- mkWeakThreadId main_thread_id
+  forM_ [ sigHUP, sigTERM, sigUSR1, sigUSR2, sigXCPU, sigXFSZ ] $ \sig ->
+    installHandler sig (Catch $ send_exception weak_tid sig) Nothing
+  where
+    send_exception weak_tid sig = do
+      m <- deRefWeak weak_tid
+      case m of
+        Nothing  -> return ()
+        Just tid -> throwTo tid (toException $ SignalException sig)
+
+
